@@ -1,0 +1,81 @@
+name: Reusable Deployment Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      deploy_to:
+        description: 'Deployment environment (e.g., development, production)'
+        required: true
+        type: string
+      AWS_REGION:
+        description: 'AWS region for deployment'
+        required: true
+        type: string
+      deploy_dir:
+        description: 'Directory where deploy scripts are located'
+        required: true
+        type: string
+      app_name:
+        description: 'Application name to deploy'
+        required: true
+        type: string
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # Step 1: Set up AWS credentials using IAM role
+      - name: Set up AWS credentials using IAM role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::904233086993:role/GITHUB-ACTIONS-RUNNER  # Replace with your IAM role ARN
+          role-session-name: github-actions-session  # A custom session name
+          aws-region: ${{ inputs.AWS_REGION }}  # AWS region passed as input
+        
+      # Step 2: ECR Login
+      - name: ECR Login
+        run: |
+          aws ecr get-login-password --region ${{ inputs.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ inputs.AWS_REGION }}.amazonaws.com
+
+      # Step 3: CodeArtifact Connection
+      - name: CodeArtifact Connection
+        run: |
+          aws codeartifact login --tool dotnet --repository nuget-repo --domain batched --domain-owner ${{ secrets.AWS_ACCOUNT_ID }}
+          aws codeartifact login --tool npm --repository npm-repo --domain batched --domain-owner ${{ secrets.AWS_ACCOUNT_ID }}
+
+      # Step 4: Build & Push Docker Image
+      - name: Build & Push Docker Image
+        run: |
+          aws ssm get-parameter --name "backend-env" --with-decryption --output text --query "Parameter.Value" > .env
+          aws ssm get-parameter --name "reporting-service" --with-decryption --output text --query "Parameter.Value" > Batched.Reporting.Web/appsettings.json
+          docker build --build-arg AWS_ACCOUNT=${{ secrets.AWS_ACCOUNT_ID }} --build-arg AWS_REGION=${{ inputs.AWS_REGION }} --no-cache -t ${{ inputs.app_name }} .
+          docker tag ${{ inputs.app_name }}:latest ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ inputs.AWS_REGION }}.amazonaws.com/${{ inputs.app_name }}:v-0.0.${{ github.run_number }}
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ inputs.AWS_REGION }}.amazonaws.com/${{ inputs.app_name }}:v-0.0.${{ github.run_number }}
+
+      # Step 5: Deploy to EKS (Elastic Kubernetes Service)
+      - name: Deploy to EKS
+        run: |
+          cd ${{ inputs.deploy_dir }}/scripts
+          sed -i "s/v-0.0.1/v-0.0.${{ github.run_number }}/g" reporting-service/values.dev.yaml
+          chmod +x -R reporting-service/*
+          helm upgrade --install ${{ inputs.app_name }} -n ${{ inputs.app_name }} ./reporting-service -f ./reporting-service/values.dev.yaml
+
+      # Step 6: Clean up Local Docker Images
+      - name: Delete Local Docker Images
+        run: |
+          docker rmi ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ inputs.AWS_REGION }}.amazonaws.com/${{ inputs.app_name }}:v-0.0.${{ github.run_number }}
+          docker rmi ${{ inputs.app_name }}:latest
+          docker image prune --filter="label=dev=reporting-base" -f
+
+    post:
+      always:
+        - name: Clean up workspace
+          run: |
+            rm -rf *
