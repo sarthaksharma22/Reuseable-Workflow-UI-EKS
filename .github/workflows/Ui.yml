@@ -24,9 +24,9 @@ on:
       contents: read
 
 jobs:
-  build_and_deploy:
+  build:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -51,12 +51,41 @@ jobs:
         run: |
           npm run build
 
-      # Step 4: Deploy to AWS S3
+      # Step 4: Upload build artifacts
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifacts
+          path: ./build  # Upload the build folder
+
+  deploy:
+    needs: build  # This ensures that deploy job runs only after build job is successful
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # Step 1: Assume AWS Role and set up AWS credentials
+      - name: Set up AWS credentials using IAM role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::904233086993:role/GITHUB-ACTIONS-RUNNER  # Replace with your IAM role ARN
+          role-session-name: github-actions-session  # A custom session name
+          aws-region: ${{ inputs.AWS_REGION }}  # AWS region passed as input
+
+      # Step 2: Download build artifacts
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+
+      # Step 3: Deploy to AWS S3
       - name: Deploy to AWS S3
         run: |
-          aws s3 sync build s3://batched-${{ inputs.deploy_to }}-ui/
+          aws s3 sync ./build s3://batched-${{ inputs.deploy_to }}-ui/
 
-      # Step 5: Invalidate CloudFront Cache
+      # Step 4: Invalidate CloudFront Cache
       - name: Invalidate CloudFront Cache
         run: |
           aws cloudfront create-invalidation --distribution-id ${{ secrets.CLOUDFORMATION_ID }} --paths "/*"

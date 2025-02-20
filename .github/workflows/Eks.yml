@@ -1,32 +1,10 @@
-name: Reusable Deployment Pipeline
-
-on:
-  workflow_call:
-    inputs:
-      deploy_to:
-        description: 'Deployment environment (e.g., development, production)'
-        required: true
-        type: string
-      AWS_REGION:
-        description: 'AWS region for deployment'
-        required: true
-        type: string
-      deploy_dir:
-        description: 'Directory where deploy scripts are located'
-        required: true
-        type: string
-      app_name:
-        description: 'Application name to deploy'
-        required: true
-        type: string
-
 jobs:
-  build_and_deploy:
+  build:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -35,10 +13,10 @@ jobs:
       - name: Set up AWS credentials using IAM role
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::904233086993:role/GITHUB-ACTIONS-RUNNER  # Replace with your IAM role ARN
-          role-session-name: github-actions-session  # A custom session name
-          aws-region: ${{ inputs.AWS_REGION }}  # AWS region passed as input
-        
+          role-to-assume: arn:aws:iam::904233086993:role/GITHUB-ACTIONS-RUNNER
+          role-session-name: github-actions-session
+          aws-region: ${{ inputs.AWS_REGION }}
+
       # Step 2: ECR Login
       - name: ECR Login
         run: |
@@ -59,23 +37,49 @@ jobs:
           docker tag ${{ inputs.app_name }}:latest ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ inputs.AWS_REGION }}.amazonaws.com/${{ inputs.app_name }}:v-0.0.${{ github.run_number }}
           docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ inputs.AWS_REGION }}.amazonaws.com/${{ inputs.app_name }}:v-0.0.${{ github.run_number }}
 
-      # Step 5: Deploy to EKS (Elastic Kubernetes Service)
-      - name: Deploy to EKS
-        run: |
-          cd ${{ inputs.deploy_dir }}/scripts
-          sed -i "s/v-0.0.1/v-0.0.${{ github.run_number }}/g" reporting-service/values.dev.yaml
-          chmod +x -R reporting-service/*
-          helm upgrade --install ${{ inputs.app_name }} -n ${{ inputs.app_name }} ./reporting-service -f ./reporting-service/values.dev.yaml
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
 
-      # Step 6: Clean up Local Docker Images
-      - name: Delete Local Docker Images
-        run: |
-          docker rmi ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ inputs.AWS_REGION }}.amazonaws.com/${{ inputs.app_name }}:v-0.0.${{ github.run_number }}
-          docker rmi ${{ inputs.app_name }}:latest
-          docker image prune --filter="label=dev=reporting-base" -f
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-    post:
-      always:
-        - name: Clean up workspace
-          run: |
-            rm -rf *
+      # Step 1: Set up AWS credentials using IAM role
+      - name: Set up AWS credentials using IAM role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::904233086993:role/GITHUB-ACTIONS-RUNNER
+          role-session-name: github-actions-session
+          aws-region: ${{ inputs.AWS_REGION }}
+
+      # Step 2: Set up KUBECONFIG for Helm Deployment
+      - name: Set up KUBECONFIG
+        run: |
+          echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+        env:
+          KUBECONFIG: ${{ secrets.KUBECONFIG }}
+
+      # Step 3: Deploy using Helm with the 'deliverybot/helm' GitHub Action
+      - name: Deploy to Kubernetes using Helm
+        uses: deliverybot/helm@v1
+        with:
+          release: ${{ inputs.app_name }}  # Helm release name
+          namespace: ${{ inputs.deploy_to }}  # The environment to deploy to (e.g., production or staging)
+          chart: './charts/${{ inputs.app_name }}'  # Path to your Helm chart
+          token: '${{ github.token }}'  # GitHub token for authentication
+          values: |
+            name: ${{ inputs.app_name }}
+            environment: ${{ inputs.deploy_to }}  # Pass deploy environment (e.g., dev, prod)
+          value-files: >-
+            [
+              "values.yaml", 
+              "values.${{ inputs.deploy_to }}.yaml"
+            ]
+          set: |
+            image.tag=${{ github.sha }}  # Dynamically set the image tag, for example, using the commit SHA
+        env:
+          KUBECONFIG: '${{ secrets.KUBECONFIG }}'  # Provide the Kubernetes config file through secret
